@@ -1,3 +1,6 @@
+# SLOPTLibAFL
+You can check out more information about SLOPTLibAFL at `fuzzers/forkserver/forkserver_slopt/README.md`.
+
 # LibAFL, the fuzzer library.
 
  <img align="right" src="https://raw.githubusercontent.com/AFLplusplus/Website/main/static/libafl_logo.svg" alt="LibAFL logo" width="250" heigh="250">
