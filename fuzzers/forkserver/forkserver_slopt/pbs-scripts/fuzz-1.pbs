@@ -1,0 +1,123 @@
+#!/bin/bash
+#PBS -N fuzz-1-libafl-fuzz-ucb
+#PBS -l select=1:ncpus=40:nodetype=n40
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -V
+set -euo pipefail
+
+# ---------- Fixed layout ----------
+ROOT="$HOME/experiment"
+TOOL="libafl"
+FUZZER_NAME="afl-fuzz-ucb"
+
+# ---------- Targets & projects ----------
+PROJECTS=( bloaty file harfbuzz libgit2 )
+declare -A PUTS=(
+  [bloaty]="fuzz_target"
+  [file]="magic_fuzzer"
+  [harfbuzz]="hb-shape-fuzzer"
+  [libgit2]="download_refs_fuzzer"
+)
+declare -A TARGET=(
+  [bloaty]="$HOME/targets/bloaty/build/fuzz_target"
+  [file]="$HOME/targets/file/magic_fuzzer"
+  [harfbuzz]="$HOME/targets/harfbuzz/build/test/fuzzing/hb-shape-fuzzer"
+  [libgit2]="$HOME/targets/libgit2/build/download_refs_fuzzer"
+)
+SEEDS_DIR="$HOME/experiment/seeds"
+
+# ---------- Run configuration ----------
+RUNS_PER_PUT=10
+
+# ---------- AFL++ environment ----------
+export AFL_SKIP_CPUFREQ=1
+export AFL_NO_UI=1
+export AFL_NO_AFFINITY=1
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+unset AFL_EXIT_ON_SEED_ISSUES || true
+
+# ---------- Node-local tmpfs ----------
+SCR="/dev/shm/$USER.$PBS_JOBID"
+mkdir -p "$SCR/bin" "$SCR/in" "$SCR/out" "$SCR/afl-tmp"
+trap 'rm -rf "$SCR"' EXIT INT TERM
+
+# ---------- Copy binaries ----------
+cp -f "$HOME/SLOPTLibAFL/fuzzers/forkserver/forkserver_slopt/target/release/$FUZZER_NAME" "$SCR/bin/fuzzer"
+chmod 0755 "$SCR/bin/fuzzer"
+
+for P in "${PROJECTS[@]}"; do
+  T="${TARGET[$P]}"
+  [[ -x "$T" ]] || { echo "ERROR: target for $P not found: $T" >&2; exit 1; }
+  cp -f "$T" "$SCR/bin/${P}_target"
+  chmod 0755 "$SCR/bin/${P}_target"
+  if [ "$P" = "file" ]; then
+    cp -L -f "$HOME/targets/file/magic/magic.mgc" "$SCR/bin/magic.mgc"
+  fi
+done
+
+# ---------- Seeds ----------
+for P in "${PROJECTS[@]}"; do
+  mkdir -p "$SCR/in/$P"
+  ZIP="$SEEDS_DIR/${PUTS[$P]}_seed_corpus.zip"
+  if [ -f "$ZIP" ]; then
+    unzip -q -o -j "$ZIP" -d "$SCR/in/$P"
+  else
+    echo "seed" > "$SCR/in/$P/seed"
+  fi
+done
+
+# ---------- Launch fuzzers ----------
+TOTAL=0
+for P in "${PROJECTS[@]}"; do
+  for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+    OUT="$SCR/out/$P/$RUN"; mkdir -p "$OUT"
+    A="$SCR/afl-tmp/$P/$RUN"; mkdir -p "$A"
+    AFL_TMPDIR="$A" \
+      "$SCR/bin/fuzzer" -t 2000 -i "$SCR/in/$P" -o "$OUT" -- \
+      "$SCR/bin/${P}_target" @@ > "$OUT/fuzzer.log" 2>&1 &
+    TOTAL=$((TOTAL+1))
+  done
+done
+echo "[$(date)] Launched $TOTAL fuzzers; starting mirror loop and waiting..."
+
+# ---- live progress mirroring (safe; only 3 files per run) ----
+SYNC_INTERVAL=60   # seconds; set to 60 for more frequent updates
+DEST_ROOT="$ROOT/$TOOL"
+
+# pre-create destination directories once
+for P in "${PROJECTS[@]}"; do
+  for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+    mkdir -p "$DEST_ROOT/$P/$FUZZER_NAME/$RUN/default"
+  done
+done
+
+stop_flag="$SCR/.stop_sync"
+
+sync_loop() {
+  while [ ! -f "$stop_flag" ]; do
+    for P in "${PROJECTS[@]}"; do
+      for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+        OUT_LOCAL="$SCR/out/$P/$RUN"
+        DEST_RUN="$DEST_ROOT/$P/$FUZZER_NAME/$RUN"
+        DEST_DEF="$DEST_RUN/default"
+
+        # copy if present; -t keeps mtime; overwrites the same file
+        [ -f "$OUT_LOCAL/fuzzer.log" ]                 && rsync -t "$OUT_LOCAL/fuzzer.log"              "$DEST_RUN/"
+        [ -f "$OUT_LOCAL/default/fuzzer_stats" ]       && rsync -t "$OUT_LOCAL/default/fuzzer_stats"    "$DEST_DEF/"
+        [ -f "$OUT_LOCAL/default/plot_data" ]          && rsync -t "$OUT_LOCAL/default/plot_data"       "$DEST_DEF/"
+      done
+    done
+    sleep "$SYNC_INTERVAL"
+  done
+}
+
+sync_loop & SYNC_PID=$!
+
+# ---------- Wait for fuzzers to finish ----------
+wait || true
+touch "$stop_flag"
+wait "$SYNC_PID" 2>/dev/null || true
+
+echo "[$(date)] Fuzzing phase ended; final sync done."
+echo "Stats and logs live at: $ROOT/$TOOL/<put>/$FUZZER_NAME/<run>/default/"

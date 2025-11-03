@@ -97,3 +97,5 @@ log
 
 # Coredumps
 *.core
+
+/fuzzers/forkserver/forkserver_slopt/results.zip

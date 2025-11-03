@@ -1,0 +1,138 @@
+#!/bin/bash
+#PBS -N fuzz-3-libafl-fuzz-ucb
+#PBS -l select=1:ncpus=20:nodetype=n40
+#PBS -l walltime=24:00:00
+#PBS -j oe
+#PBS -V
+set -euo pipefail
+
+# ---------- Fixed layout ----------
+ROOT="$HOME/experiment"
+TOOL="libafl"
+FUZZER_NAME="afl-fuzz-ucb"
+
+# ---------- Targets & projects ----------
+PROJECTS=( tpm2 xpdf-4.03 )
+declare -A PUTS=(
+  [tpm2]="tpm2_execute_command_fuzzer"
+  [xpdf-4.03]="fuzz_pdfload"
+)
+declare -A TARGET=(
+  [tpm2]="$HOME/targets/tpm2/tpm2_execute_command_fuzzer"
+  [xpdf-4.03]="$HOME/targets/xpdf-4.03/build/fuzz_pdfload"
+)
+SEEDS_DIR="$HOME/experiment/seeds"
+
+# ---------- Run configuration ----------
+RUNS_PER_PUT=10
+
+# ---------- AFL++ environment ----------
+export AFL_SKIP_CPUFREQ=1
+export AFL_NO_UI=1
+export AFL_NO_AFFINITY=1
+export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+unset AFL_EXIT_ON_SEED_ISSUES || true
+
+# ---------- Use node RAM (/dev/shm) ----------
+SCR="/dev/shm/$USER.$PBS_JOBID"
+rm -rf "$SCR" 2>/dev/null || true
+mkdir -p "$SCR/bin" "$SCR/in" "$SCR/out" "$SCR/afl-tmp"
+trap 'rm -rf "$SCR"' EXIT INT TERM
+
+# Fuzzer binary -> local
+cp -f "$HOME/SLOPTLibAFL/fuzzers/forkserver/forkserver_slopt/target/release/$FUZZER_NAME" "$SCR/bin/fuzzer"
+chmod 0755 "$SCR/bin/fuzzer"
+
+# Copy relocatable targets locally (skip tpm2: runs in-place)
+for P in "${PROJECTS[@]}"; do
+  TGT="${TARGET[$P]}"
+  [[ -x "$TGT" ]] || { echo "ERROR: target for $P not found: $TGT" >&2; exit 1; }
+
+  if [ "$P" != "tpm2" ]; then
+    cp -f "$TGT" "$SCR/bin/${P}_target"
+    chmod 0755 "$SCR/bin/${P}_target"
+  fi
+
+  # special data file for 'file' project
+  if [ "$P" = "file" ]; then
+    cp -L -f "$HOME/targets/file/magic/magic.mgc" "$SCR/bin/magic.mgc"
+  fi
+done
+
+# Seeds -> local
+for P in "${PROJECTS[@]}"; do
+  mkdir -p "$SCR/in/$P"
+  ZIP="$SEEDS_DIR/${PUTS[$P]}_seed_corpus.zip"
+  if [ -f "$ZIP" ]; then
+    unzip -q -o -j "$ZIP" -d "$SCR/in/$P"
+  else
+    echo "seed" > "$SCR/in/$P/seed"
+  fi
+done
+
+# ---------- Launch fuzzers ----------
+TOTAL=0
+for P in "${PROJECTS[@]}"; do
+  for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+    OUT="$SCR/out/$P/$RUN"; mkdir -p "$OUT"
+    A="$SCR/afl-tmp/$P/$RUN"; mkdir -p "$A"
+
+    if [ "$P" = "tpm2" ]; then
+      # tpm2 must run in its own build dir (in-place)
+      TGT_PATH="${TARGET[$P]}"
+      TGT_DIR="$(dirname "$TGT_PATH")"
+      (
+        cd "$TGT_DIR"
+        AFL_TMPDIR="$A" \
+          "$SCR/bin/fuzzer" -t 2000 -i "$SCR/in/$P" -o "$OUT" -- \
+          "$TGT_PATH" @@ > "$OUT/fuzzer.log" 2>&1
+      ) &
+    else
+      AFL_TMPDIR="$A" \
+        "$SCR/bin/fuzzer" -t 2000 -i "$SCR/in/$P" -o "$OUT" -- \
+        "$SCR/bin/${P}_target" @@ > "$OUT/fuzzer.log" 2>&1 &
+    fi
+
+    TOTAL=$((TOTAL+1))
+  done
+done
+
+echo "[$(date)] Launched $TOTAL fuzzers; starting mirror loop and waiting..."
+
+# ---- live progress mirroring (safe; only 3 files per run) ----
+SYNC_INTERVAL=60   # seconds; set to 60 for more frequent updates
+DEST_ROOT="$ROOT/$TOOL"
+
+# pre-create destination directories once
+for P in "${PROJECTS[@]}"; do
+  for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+    mkdir -p "$DEST_ROOT/$P/$FUZZER_NAME/$RUN/default"
+  done
+done
+
+stop_flag="$SCR/.stop_sync"
+
+sync_loop() {
+  while [ ! -f "$stop_flag" ]; do
+    for P in "${PROJECTS[@]}"; do
+      for RUN in $(seq 0 $((RUNS_PER_PUT-1))); do
+        OUT_LOCAL="$SCR/out/$P/$RUN"
+        DEST_RUN="$DEST_ROOT/$P/$FUZZER_NAME/$RUN"
+        DEST_DEF="$DEST_RUN/default"
+        [ -f "$OUT_LOCAL/fuzzer.log" ]                 && rsync -t "$OUT_LOCAL/fuzzer.log"              "$DEST_RUN/"
+        [ -f "$OUT_LOCAL/default/fuzzer_stats" ]       && rsync -t "$OUT_LOCAL/default/fuzzer_stats"    "$DEST_DEF/"
+        [ -f "$OUT_LOCAL/default/plot_data" ]          && rsync -t "$OUT_LOCAL/default/plot_data"       "$DEST_DEF/"
+      done
+    done
+    sleep "$SYNC_INTERVAL"
+  done
+}
+
+sync_loop & SYNC_PID=$!
+
+# Wait for all fuzzers; stop mirror; done
+wait || true
+touch "$stop_flag"
+wait "$SYNC_PID" 2>/dev/null || true
+
+echo "[$(date)] Done. Logs and stats under: $ROOT/$TOOL/<put>/$FUZZER_NAME/<run>/ (default/ for stats)"
